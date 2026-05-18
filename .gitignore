@@ -6,3 +6,6 @@ venv/
 
 # Real camera config holds credentials — never commit it.
 cameras.toml
+/.vs/RTSP_Node/v17
+/.vs/RTSP_Node/CopilotIndices/17.14.1679.25730
+/.vs/RTSP_Node/FileContentIndex
