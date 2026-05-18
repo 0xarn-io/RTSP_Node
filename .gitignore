@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venvpkgs/
+.venv/
+venv/
+
+# Real camera config holds credentials — never commit it.
+cameras.toml

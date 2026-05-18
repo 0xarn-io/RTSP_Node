@@ -1,0 +1,20 @@
+# Copy this file to cameras.toml and fill in your real cameras.
+# Override the path with the RTSP_NODE_CONFIG environment variable.
+#
+# cameras.toml is gitignored so credentials never get committed.
+
+[server]
+host = "0.0.0.0"
+port = 8000
+
+[[cameras]]
+id = "front_door"
+name = "Front Door"
+url = "rtsp://user:password@192.168.1.10:554/Streaming/Channels/101"
+# Optional: refuse to serve frames older than this many seconds (0 = disabled).
+max_frame_age_s = 0.0
+
+[[cameras]]
+id = "backyard"
+name = "Backyard"
+url = "rtsp://user:password@192.168.1.11:554/Streaming/Channels/101"
