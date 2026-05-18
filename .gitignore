@@ -4,9 +4,18 @@ __pycache__/
 .venv/
 venv/
 
+<<<<<<< HEAD
 # Real camera config holds credentials — never commit it.
 /.vs/RTSP_Node/v17
 /.vs/RTSP_Node/CopilotIndices/17.14.1679.25730
 /.vs/RTSP_Node/FileContentIndex
 /.vs/slnx.sqlite
+/.vs/VSWorkspaceState.json
+=======
+# Visual Studio IDE state
+.vs/
+>>>>>>> 9b6c938e99a71a467d16aee4c8984619624b35ae
+/.vs/ProjectSettings.json
+/.vs/ProjectSettings.json
+/.vs/PythonSettings.json
 /.vs/VSWorkspaceState.json

@@ -1,7 +1,6 @@
-# Copy this file to cameras.toml and fill in your real cameras.
-# Override the path with the RTSP_NODE_CONFIG environment variable.
-#
-# cameras.toml is gitignored so credentials never get committed.
+# RTSP node config. This file is TRACKED in git, so keep only placeholder
+# credentials here. For real cameras, point RTSP_NODE_CONFIG at a private
+# config file kept outside the repo (or inject credentials at deploy time).
 
 [server]
 host = "0.0.0.0"
