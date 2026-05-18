@@ -5,7 +5,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_CONFIG_PATH = "cameras.toml"
+DEFAULT_CONFIG_PATH = "config.toml"
 CONFIG_ENV_VAR = "RTSP_NODE_CONFIG"
 
 
@@ -39,8 +39,8 @@ def load_config(path: Path | None = None) -> Config:
     if not path.is_file():
         raise FileNotFoundError(
             f"Config file not found: {path}. "
-            f"Copy cameras.example.toml to {DEFAULT_CONFIG_PATH} "
-            f"(or set {CONFIG_ENV_VAR}) and fill in your cameras."
+            f"Create {DEFAULT_CONFIG_PATH} (or set {CONFIG_ENV_VAR}) "
+            f"with [server] and [[cameras]] entries."
         )
 
     with path.open("rb") as fh:
