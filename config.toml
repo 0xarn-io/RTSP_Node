@@ -4,16 +4,18 @@
 
 [server]
 host = "0.0.0.0"
-port = 8000
+port = 9005
 
 [[cameras]]
-id = "front_door"
-name = "Front Door"
-url = "rtsp://user:password@192.168.1.10:554/Streaming/Channels/101"
+id = "Entry"
+name = "Entry"
+url = "rtsp://192.168.125.50:554"
 # Optional: refuse to serve frames older than this many seconds (0 = disabled).
 max_frame_age_s = 0.0
 
 [[cameras]]
-id = "backyard"
-name = "Backyard"
-url = "rtsp://user:password@192.168.1.11:554/Streaming/Channels/101"
+id = "Exit"
+name = "Exit"
+url = "rtsp://192.168.125.51:554"
+# Optional: refuse to serve frames older than this many seconds (0 = disabled).
+max_frame_age_s = 0.0
