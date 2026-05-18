@@ -19,3 +19,4 @@ venv/
 /.vs/ProjectSettings.json
 /.vs/PythonSettings.json
 /.vs/VSWorkspaceState.json
+/.vs/slnx.sqlite
