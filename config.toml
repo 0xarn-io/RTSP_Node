@@ -1,0 +1,21 @@
+# RTSP node config. This file is TRACKED in git, so keep only placeholder
+# credentials here. For real cameras, point RTSP_NODE_CONFIG at a private
+# config file kept outside the repo (or inject credentials at deploy time).
+
+[server]
+host = "0.0.0.0"
+port = 9005
+
+[[cameras]]
+id = "Entry"
+name = "Entry"
+url = "rtsp://192.168.125.50:554"
+# Optional: refuse to serve frames older than this many seconds (0 = disabled).
+max_frame_age_s = 0.0
+
+[[cameras]]
+id = "Exit"
+name = "Exit"
+url = "rtsp://192.168.125.51:554"
+# Optional: refuse to serve frames older than this many seconds (0 = disabled).
+max_frame_age_s = 0.0
