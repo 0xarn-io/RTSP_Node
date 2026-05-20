@@ -7,11 +7,14 @@ app via FastAPI's ``lifespan`` hook.
 """
 from __future__ import annotations
 
+import io
 import logging
 import time
 from contextlib import asynccontextmanager
+from uuid import UUID
 
 import cv2
+import piexif
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
 
 from camera import CameraManager, CameraWorker
@@ -131,14 +134,32 @@ async def camera_status(camera: CameraWorker = Depends(get_camera)):
 def screenshot(
     camera: CameraWorker = Depends(get_camera),
     quality: int = Query(90, ge=1, le=100, description="JPEG quality (1-100)"),
+    uuid: str | None = Query(
+        None,
+        description="Optional UUID (dashed or 32-char hex) stamped into "
+                    "the JPEG's EXIF ImageUniqueID tag for traceability.",
+    ),
 ):
     """Return the camera's latest frame as a JPEG image.
 
     404 = unknown camera (from get_camera), 503 = connected/connecting but
-    no frame captured yet, 500 = the frame failed to JPEG-encode.
+    no frame captured yet, 500 = the frame failed to JPEG-encode,
+    400 = the supplied ``uuid`` is not a valid hex UUID.
     Frame metadata is returned in ``X-Frame-*`` response headers so clients
-    can read it without decoding the image.
+    can read it without decoding the image. If ``uuid`` is provided it is
+    also written into the JPEG's EXIF so the identifier travels with the
+    image bytes (useful when the screenshot is stored or relayed).
     """
+    # Validate the UUID up front so we return 400 before doing capture
+    # work, and normalize to a canonical 32-char lowercase hex string
+    # (the form ImageUniqueID is specified to hold).
+    image_uid_hex: str | None = None
+    if uuid is not None:
+        try:
+            image_uid_hex = UUID(uuid).hex
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail=f"Invalid UUID: {uuid!r}")
+
     snap = camera.snapshot()
     if snap is None:
         raise HTTPException(
@@ -150,6 +171,21 @@ def screenshot(
     ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to encode frame.")
+    jpeg_bytes = buf.tobytes()
+
+    # cv2.imencode writes no EXIF, so if the caller asked for the UUID to
+    # be stamped, splice an EXIF block in with piexif. The EXIF dict is
+    # nested by IFD ("Exif" = the EXIF sub-IFD where ImageUniqueID lives).
+    if image_uid_hex is not None:
+        exif_dict = {
+            "Exif": {
+                piexif.ExifIFD.ImageUniqueID: image_uid_hex.encode("ascii"),
+            }
+        }
+        exif_bytes = piexif.dump(exif_dict)
+        out = io.BytesIO()
+        piexif.insert(exif_bytes, jpeg_bytes, out)
+        jpeg_bytes = out.getvalue()
 
     height, width = frame.shape[:2]  # numpy shape is (rows, cols, channels)
     headers = {
@@ -160,7 +196,10 @@ def screenshot(
         "X-Frame-Height": str(height),
         "Cache-Control": "no-store",  # a live snapshot must never be cached
     }
-    return Response(content=buf.tobytes(), media_type="image/jpeg", headers=headers)
+    # Echo the canonical UUID so clients don't have to crack open the EXIF.
+    if image_uid_hex is not None:
+        headers["X-Frame-UUID"] = image_uid_hex
+    return Response(content=jpeg_bytes, media_type="image/jpeg", headers=headers)
 
 
 # Allows `python main.py` to run the server using the [server] section of
