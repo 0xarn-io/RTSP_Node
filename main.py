@@ -19,9 +19,10 @@ import cv2
 import piexif
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 
 from camera import CameraManager, CameraWorker, rotate_image
-from config import load_config
+from config import _parse_roi, load_config, update_camera_in_file
 
 logging.basicConfig(
     level=logging.INFO,
@@ -295,6 +296,10 @@ _SETUP_PAGE = """<!doctype html>
     <canvas id="preview" width="200" height="200"></canvas>
     <div class="row">Paste into this camera's <code>config.toml</code> entry:</div>
     <pre id="out">rotate = __ROTATE__</pre>
+    <div class="row">
+      <button id="applycfg">Apply to camera &amp; save</button>
+      <span class="muted" id="applymsg"></span>
+    </div>
   </div>
 </div>
 <script>
@@ -311,6 +316,7 @@ const rx = document.getElementById('rx');
 const ry = document.getElementById('ry');
 const rw = document.getElementById('rw');
 const rh = document.getElementById('rh');
+const applymsg = document.getElementById('applymsg');
 const initialRoi = __ROI_JS__;  // [x, y, w, h] from config, or null
 let roi = null;  // [x, y, w, h] in natural pixels
 
@@ -409,6 +415,24 @@ document.getElementById('applyroi').addEventListener('click', () => {
   setRoi(parseInt(rx.value) || 0, parseInt(ry.value) || 0,
          parseInt(rw.value) || 1, parseInt(rh.value) || 1);
 });
+document.getElementById('applycfg').addEventListener('click', async () => {
+  const payload = { rotate: parseFloat(angleEl.value) || 0 };
+  if (roi) payload.roi = roi;
+  applymsg.textContent = 'applying...';
+  try {
+    const resp = await fetch(`/cameras/${encodeURIComponent(camId)}/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    applymsg.textContent = resp.ok
+      ? 'applied & saved to config.toml'
+      : ('error: ' + (data.detail || resp.status));
+  } catch (e) {
+    applymsg.textContent = 'error: ' + e;
+  }
+});
 loadFrame();
 </script>
 </body>
@@ -427,6 +451,32 @@ def setup_tool(camera: CameraWorker = Depends(get_camera)):
         .replace("__ROTATE__", str(camera.cam.rotate))
     )
     return HTMLResponse(content=page)
+
+
+class ConfigUpdate(BaseModel):
+    """Body for POST /cameras/{id}/config (sent by the setup tool)."""
+    rotate: float = 0.0
+    roi: list[int] | None = None  # [x, y, width, height]; omit to leave unchanged
+
+
+@app.post("/cameras/{camera_id}/config")
+def update_camera_config(body: ConfigUpdate, camera: CameraWorker = Depends(get_camera)):
+    """Apply rotate/roi to a running camera and persist them to config.toml.
+
+    Powers the setup tool's "Apply" button. 422 = invalid roi, 500 = the
+    live update succeeded conceptually but writing config.toml failed.
+    """
+    try:
+        roi = _parse_roi(camera.cam.id, body.roi)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    # Persist first, so a write failure leaves the running config untouched.
+    try:
+        update_camera_in_file(camera.cam.id, rotate=body.rotate, roi=roi)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to write config: {exc}")
+    camera.update_config(rotate=body.rotate, roi=roi)
+    return camera.status()
 
 
 # Allows `python main.py` to run the server using the [server] section of

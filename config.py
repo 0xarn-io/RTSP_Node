@@ -141,3 +141,32 @@ def load_config(path: Path | None = None) -> Config:
         raise ValueError("No cameras configured: add at least one [[cameras]] entry.")
 
     return Config(server=server, cameras=cameras)
+
+
+def update_camera_in_file(
+    camera_id: str,
+    *,
+    rotate: float | None = None,
+    roi: tuple[int, int, int, int] | None = None,
+    path: Path | None = None,
+) -> None:
+    """Persist ``rotate`` and/or ``roi`` for one camera back to the TOML
+    file, preserving comments and formatting.
+
+    Uses tomlkit (imported lazily so the read path never depends on it).
+    Raises KeyError if the camera id is not present in the file.
+    """
+    import tomlkit
+
+    path = path or config_path()
+    doc = tomlkit.parse(path.read_text(encoding="utf-8"))
+    for entry in doc.get("cameras", []):
+        if str(entry.get("id", "")).strip() == camera_id:
+            if rotate is not None:
+                entry["rotate"] = rotate
+            if roi is not None:
+                entry["roi"] = list(roi)
+            break
+    else:
+        raise KeyError(f"Camera '{camera_id}' not found in {path}")
+    path.write_text(tomlkit.dumps(doc), encoding="utf-8")
