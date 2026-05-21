@@ -1,15 +1,12 @@
 """Background RTSP capture.
 
-The core idea: opening an RTSP stream is slow (the handshake can take
-1-3 seconds), so we do NOT connect on every screenshot request. Instead,
-each camera gets one long-lived background thread that connects once,
-then continuously reads frames and keeps only the most recent one in
-memory. An HTTP request just copies that latest frame, so screenshots are
-near-instant.
-
-Two classes:
-  * :class:`CameraWorker`  - one thread + one RTSP connection per camera.
-  * :class:`CameraManager` - owns all workers, started/stopped with the app.
+Opening an RTSP stream is slow (the handshake can take 1-3 seconds), so we
+never connect per request. Each camera gets one long-lived background
+thread (:class:`CameraWorker`) that connects once and continuously keeps
+the latest decoded frame in memory; a request just grabs that frame and
+runs it through the imaging pipeline, so screenshots are near-instant.
+:class:`CameraManager` owns one worker per configured camera and is
+started/stopped with the app.
 """
 from __future__ import annotations
 
@@ -21,67 +18,30 @@ from dataclasses import replace
 from typing import Optional
 
 import cv2
-import numpy as np
 
+import imaging
 from config import CameraConfig
 
 logger = logging.getLogger("rtsp_node.camera")
 
 # Force RTSP over TCP. The default (UDP) silently drops packets on a busy
-# network, which shows up as torn or green/garbled frames. This env var is
-# read by OpenCV's FFmpeg backend when a VideoCapture is created.
+# network, producing torn or green/garbled frames. OpenCV's FFmpeg backend
+# reads this env var when a VideoCapture is created.
 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
 
 # Reconnect strategy: after a failed connection wait 1s, then double the
-# wait each retry up to a 30s ceiling, so a down camera doesn't spin the
-# CPU but a briefly-flaky one still recovers quickly.
+# wait each retry up to a 30s ceiling — a down camera doesn't spin the CPU,
+# a briefly-flaky one still recovers quickly.
 _RECONNECT_BACKOFF_START_S = 1.0
 _RECONNECT_BACKOFF_MAX_S = 30.0
-# How many consecutive failed reads we tolerate before deciding the
-# stream is dead and tearing the connection down to reconnect.
+# Consecutive failed reads tolerated before we decide the stream is dead
+# and tear the connection down to reconnect.
 _MAX_READ_FAILURES = 30
-
-
-def rotate_image(frame, degrees: float):
-    """Rotate a BGR frame about its center, keeping the original width and
-    height. Positive ``degrees`` rotate counter-clockwise (OpenCV
-    convention). The canvas size is preserved so ROI coordinates stay in a
-    stable space regardless of angle; corners exposed by the rotation are
-    filled black. Returns the input unchanged when ``degrees`` is 0.
-    """
-    if not degrees:
-        return frame
-    h, w = frame.shape[:2]
-    matrix = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), degrees, 1.0)
-    return cv2.warpAffine(frame, matrix, (w, h))
-
-
-def undistort_image(frame, undistort):
-    """Correct lens (barrel/fisheye) distortion with a simple radial model.
-
-    ``undistort`` is ``(k1, k2, focal_ratio)`` or None. The camera matrix is
-    assumed centered with focal length ``focal_ratio * frame_width``; k1/k2
-    are the radial distortion coefficients. Output keeps the input WxH.
-    Returns the input unchanged when there's nothing to correct (k1==k2==0).
-    """
-    if undistort is None:
-        return frame
-    k1, k2, f_ratio = undistort
-    if k1 == 0.0 and k2 == 0.0:
-        return frame
-    h, w = frame.shape[:2]
-    f = f_ratio * w
-    camera_matrix = np.array([[f, 0.0, w / 2.0],
-                              [0.0, f, h / 2.0],
-                              [0.0, 0.0, 1.0]])
-    dist = np.array([k1, k2, 0.0, 0.0, 0.0])
-    return cv2.undistort(frame, camera_matrix, dist)
 
 
 class CameraWorker:
     """Owns one RTSP connection in a background thread, always holding the
-    latest decoded frame so screenshots are served without per-request
-    connection latency.
+    latest decoded frame.
 
     Threading note: ``_frame``/``_frame_ts`` are written by the capture
     thread and read by HTTP request threads, so every access goes through
@@ -91,9 +51,9 @@ class CameraWorker:
     def __init__(self, cam: CameraConfig):
         self.cam = cam
         self._lock = threading.Lock()
-        self._frame = None  # latest frame: numpy.ndarray (BGR) or None
-        self._frame_ts: float = 0.0  # wall-clock time the frame was grabbed
-        self._connected = False  # True while the RTSP stream is open
+        self._frame = None             # latest frame: numpy.ndarray (BGR) or None
+        self._frame_ts: float = 0.0    # wall-clock time the frame was grabbed
+        self._connected = False        # True while the RTSP stream is open
         self._stop = threading.Event()  # set() asks the capture loop to stop
         self._thread: Optional[threading.Thread] = None
 
@@ -121,8 +81,8 @@ class CameraWorker:
         """Open the RTSP stream. CAP_FFMPEG forces the FFmpeg backend."""
         cap = cv2.VideoCapture(self.cam.url, cv2.CAP_FFMPEG)
         # Shrink the internal buffer to 1 frame so cap.read() returns the
-        # newest frame instead of slowly draining a backlog (low latency).
-        # Not all backends honor this, hence the guarded set().
+        # newest frame instead of draining a backlog (low latency). Not all
+        # backends honor this, hence the guarded set().
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except cv2.error:
@@ -142,19 +102,17 @@ class CameraWorker:
             if not cap.isOpened():
                 # Couldn't connect. Release, wait (interruptibly), back off.
                 cap.release()
-                self._set_disconnected()
+                self._connected = False
                 logger.warning(
                     "camera %s: cannot open stream, retrying in %.0fs",
-                    self.cam.id,
-                    backoff,
+                    self.cam.id, backoff,
                 )
                 self._stop.wait(backoff)
                 backoff = min(backoff * 2, _RECONNECT_BACKOFF_MAX_S)
                 continue
 
-            # Connected: reset the backoff for the next disconnect.
             logger.info("camera %s: connected", self.cam.id)
-            backoff = _RECONNECT_BACKOFF_START_S
+            backoff = _RECONNECT_BACKOFF_START_S  # reset for the next disconnect
             self._connected = True
             failures = 0
 
@@ -165,13 +123,9 @@ class CameraWorker:
                 if not ok or frame is None:
                     failures += 1
                     if failures >= _MAX_READ_FAILURES:
-                        # Stream is wedged; break out to reconnect.
-                        logger.warning(
-                            "camera %s: stream stalled, reconnecting", self.cam.id
-                        )
-                        break
-                    # Brief, interruptible pause before retrying the read.
-                    self._stop.wait(0.05)
+                        logger.warning("camera %s: stream stalled, reconnecting", self.cam.id)
+                        break  # leave inner loop -> reconnect
+                    self._stop.wait(0.05)  # brief, interruptible pause
                     continue
 
                 # Good frame: publish it as "the latest" under the lock.
@@ -180,27 +134,22 @@ class CameraWorker:
                     self._frame = frame
                     self._frame_ts = time.time()
 
-            # Left the read loop (stop requested or stream stalled).
             cap.release()
-            self._set_disconnected()
+            self._connected = False
 
-        self._set_disconnected()
         logger.info("camera %s: worker stopped", self.cam.id)
 
-    def _set_disconnected(self) -> None:
-        self._connected = False
-
-    # --- readers -----------------------------------------------------------
+    # --- reads / live updates ----------------------------------------------
 
     def snapshot(self):
-        """Return ``(frame_copy, timestamp)`` of the latest frame, or None.
+        """Return ``(frame_copy, timestamp)`` of the latest *processed* frame,
+        or None if no frame has arrived yet.
 
-        Returns a *copy* so the caller can encode it without holding the
-        lock or racing the capture thread's next write. Honors
-        ``max_frame_age_s``: a frame older than the configured limit is
-        treated as unavailable (stale/frozen stream). The configured
-        ``rotate`` is applied to the full frame first, then the ``roi`` crop;
-        a ``ValueError`` is raised if the ROI exceeds the (rotated) frame.
+        The frame is run through the imaging pipeline (undistort -> rotate ->
+        crop) using this camera's config; raises ValueError if the ROI
+        exceeds the frame. Honors ``max_frame_age_s`` (a too-old frame counts
+        as unavailable). Returns a contiguous copy so the caller can encode
+        it without holding the lock or racing the capture thread.
         """
         with self._lock:
             if self._frame is None:
@@ -211,33 +160,25 @@ class CameraWorker:
             frame = self._frame
             ts = self._frame_ts
 
-        # The capture thread only ever rebinds self._frame to a brand-new
-        # array (it never mutates one in place), so it is safe to transform
-        # this grabbed reference after releasing the lock.
-        # Pipeline order: undistort the lens first, then rotate to level,
-        # then crop the ROI (which is defined in undistorted+rotated
-        # coordinates, exactly what the setup tool shows you).
-        frame = undistort_image(frame, self.cam.undistort)
-        frame = rotate_image(frame, self.cam.rotate)
-        if self.cam.roi is None:
-            return frame.copy(), ts
-        x, y, w, h = self.cam.roi
-        fh, fw = frame.shape[:2]
-        # Same crop convention as the downstream vision.crop_to_roi:
-        # img[y:y+h, x:x+w]. A ROI that runs past the frame is an error,
-        # not something to silently clip — a wrong-sized crop would corrupt
-        # a fixed-input CNN, so fail loudly instead.
-        if x + w > fw or y + h > fh:
-            raise ValueError(
-                f"camera {self.cam.id}: ROI x={x} y={y} {w}x{h} exceeds "
-                f"frame {fw}x{fh}"
-            )
-        return frame[y:y + h, x:x + w].copy(), ts
+        # The capture thread only ever rebinds self._frame to a new array
+        # (never mutates one in place), so transforming this grabbed
+        # reference after releasing the lock is safe. The final .copy()
+        # de-aliases from self._frame and gives cv2 a contiguous buffer.
+        processed = imaging.process_frame(
+            frame,
+            undistort_params=self.cam.undistort,
+            rotate_degrees=self.cam.rotate,
+            roi=self.cam.roi,
+        )
+        return processed.copy(), ts
 
     def latest_raw(self):
-        """Return ``(frame_copy, timestamp)`` of the latest *uncropped,
-        unrotated* frame, or None. Used by the setup tool, which applies its
-        own trial rotation and lets you draw the ROI on the result."""
+        """Return ``(frame_copy, timestamp)`` of the latest *raw* frame
+        (uncropped, unrotated, no undistort), or None.
+
+        Used by the setup tool, which applies its own trial transforms and
+        lets you draw the ROI on the result.
+        """
         with self._lock:
             if self._frame is None:
                 return None
@@ -246,9 +187,11 @@ class CameraWorker:
     def update_config(self, *, rotate: float | None = None,
                       roi: tuple[int, int, int, int] | None = None,
                       undistort: tuple[float, float, float] | None = None) -> None:
-        """Live-swap this worker's rotation/ROI/undistort by replacing the
+        """Live-swap this worker's rotate/roi/undistort by replacing the
         frozen CameraConfig. snapshot() picks it up on its next call, since
-        the whole self.cam object is reassigned in one atomic step."""
+        the whole self.cam object is reassigned in one atomic step. Only the
+        keyword arguments that are not None are changed.
+        """
         changes = {}
         if rotate is not None:
             changes["rotate"] = rotate
@@ -281,8 +224,8 @@ class CameraWorker:
         if self.cam.rotate:
             info["rotate"] = self.cam.rotate
         if self.cam.undistort is not None and (self.cam.undistort[0] or self.cam.undistort[1]):
-            k1, k2, f = self.cam.undistort
-            info["undistort"] = {"k1": k1, "k2": k2, "f": f}
+            k1, k2, focal_ratio = self.cam.undistort
+            info["undistort"] = {"k1": k1, "k2": k2, "f": focal_ratio}
         if self.cam.roi is not None:
             x, y, w, h = self.cam.roi
             info["roi"] = {"x": x, "y": y, "width": w, "height": h}
@@ -297,8 +240,8 @@ class CameraWorker:
 
 
 class CameraManager:
-    """Owns one :class:`CameraWorker` per configured camera and exposes
-    them by id. Created once at app startup, torn down at shutdown."""
+    """Owns one :class:`CameraWorker` per configured camera and exposes them
+    by id. Created once at app startup, torn down at shutdown."""
 
     def __init__(self, cameras: list[CameraConfig]):
         self._workers: dict[str, CameraWorker] = {

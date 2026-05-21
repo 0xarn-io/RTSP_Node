@@ -1,55 +1,55 @@
-"""Loads and validates the application's TOML configuration.
+"""Configuration: load the TOML file into typed objects, and write tuned
+values back to it.
 
-The whole node is driven by a single TOML file (``config.toml`` by
-default, or whatever ``RTSP_NODE_CONFIG`` points at). This module turns
-that file into typed, immutable dataclasses so the rest of the code never
-touches raw dicts, and it fails fast with a clear message when the file is
-missing, malformed, or logically invalid (no cameras, duplicate ids, ...).
+The whole node is driven by one TOML file (``config.toml`` by default, or
+whatever ``RTSP_NODE_CONFIG`` points at). Reading turns the file into frozen
+dataclasses so the rest of the code never juggles raw dicts; it fails fast
+with a clear message if the file is missing or invalid. Writing
+(:func:`update_camera_in_file`) is used by the setup tool to persist tuned
+rotate/roi/undistort values while preserving comments and formatting.
 """
 from __future__ import annotations
 
 import os
-import tomllib  # standard library TOML parser (Python 3.11+)
+import tomllib  # standard-library TOML reader (Python 3.11+)
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Filename used when the RTSP_NODE_CONFIG environment variable is not set.
+# Config file used when RTSP_NODE_CONFIG is not set.
 DEFAULT_CONFIG_PATH = "config.toml"
-# Environment variable that overrides the config path (e.g. to point at a
-# private file outside the repo on a real deployment).
+# Env var that overrides the config path (e.g. to point at a private file
+# outside the repo on a real deployment).
 CONFIG_ENV_VAR = "RTSP_NODE_CONFIG"
 
 
-# frozen=True makes instances read-only (hashable, can't be mutated by
-# accident after they're loaded once at startup).
+# frozen=True makes instances read-only (so config can't be mutated by
+# accident after startup). The capture worker swaps in a *new* CameraConfig
+# via dataclasses.replace when the setup tool changes a value live.
 @dataclass(frozen=True)
 class CameraConfig:
-    """One [[cameras]] entry from the TOML file."""
+    """One ``[[cameras]]`` entry from the TOML file."""
 
-    id: str           # unique key used in API paths, e.g. /cameras/<id>
+    id: str            # unique key used in API paths, e.g. /cameras/<id>
     url: str           # full RTSP URL the capture thread connects to
     name: str = ""     # human-friendly label shown in status responses
     # If > 0, a frame older than this many seconds is treated as missing
-    # (protects against serving a stale image from a frozen stream).
+    # (guards against serving a stale image from a frozen stream).
     max_frame_age_s: float = 0.0
-    # Optional crop box [x, y, width, height] in pixels. When set, served
-    # screenshots are cropped to this region (e.g. [826, 345, 832, 832]
-    # yields 832x832 images). None = serve the full frame.
+    # Crop box [x, y, width, height] in pixels, applied last in the pipeline.
+    # e.g. [826, 345, 832, 832] yields 832x832 images. None = full frame.
     roi: tuple[int, int, int, int] | None = None
-    # Optional rotation in degrees (counter-clockwise, OpenCV convention)
-    # applied to the full frame BEFORE the roi crop — use it to level or
-    # orient a tilted camera. 0 = no rotation.
+    # Rotation in degrees (CCW), applied after undistort and before crop.
+    # Use it to level/orient a tilted camera. 0 = no rotation.
     rotate: float = 0.0
-    # Optional lens undistortion [k1, k2, focal_ratio]: k1/k2 are radial
-    # distortion coefficients and focal_ratio is the focal length as a
-    # fraction of frame width. Applied to the full frame FIRST, before
-    # rotate and crop. None (or k1=k2=0) means no correction.
+    # Lens undistortion [k1, k2, focal_ratio], applied first in the pipeline.
+    # k1/k2 are radial coefficients; focal_ratio is the focal length as a
+    # fraction of frame width. None (or k1=k2=0) means no correction.
     undistort: tuple[float, float, float] | None = None
 
 
 @dataclass(frozen=True)
 class ServerConfig:
-    """The [server] table: where this node's own HTTP API binds.
+    """The ``[server]`` table: where this node's own HTTP API binds.
 
     Only used by the ``python main.py`` entrypoint; ignored when launched
     via the uvicorn/gunicorn CLI directly.
@@ -63,53 +63,50 @@ class ServerConfig:
 class Config:
     """The fully parsed configuration file."""
 
-    # default_factory is required because dataclass fields can't share a
-    # single mutable default instance across objects.
+    # default_factory: dataclass fields can't share one mutable default.
     server: ServerConfig = field(default_factory=ServerConfig)
     cameras: list[CameraConfig] = field(default_factory=list)
 
+
+# --- parsing/validation helpers (also reused by the API to validate input) ---
+
+def parse_roi(cam_id: str, raw) -> tuple[int, int, int, int] | None:
+    """Validate an optional [x, y, width, height] crop box."""
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+        raise ValueError(f"Camera '{cam_id}' roi must be a 4-element [x, y, width, height].")
+    x, y, w, h = (int(v) for v in raw)
+    if x < 0 or y < 0 or w <= 0 or h <= 0:
+        raise ValueError(f"Camera '{cam_id}' roi needs x,y >= 0 and width,height > 0.")
+    return (x, y, w, h)
+
+
+def parse_undistort(cam_id: str, raw) -> tuple[float, float, float] | None:
+    """Validate an optional [k1, k2, focal_ratio] undistortion triple."""
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)) or len(raw) != 3:
+        raise ValueError(f"Camera '{cam_id}' undistort must be [k1, k2, focal_ratio].")
+    k1, k2, focal_ratio = (float(v) for v in raw)
+    if focal_ratio <= 0:
+        raise ValueError(f"Camera '{cam_id}' undistort focal_ratio must be > 0.")
+    return (k1, k2, focal_ratio)
+
+
+# --- read ---------------------------------------------------------------------
 
 def config_path() -> Path:
     """Resolve which file to load: the env override, else the default."""
     return Path(os.environ.get(CONFIG_ENV_VAR, DEFAULT_CONFIG_PATH))
 
 
-def _parse_roi(cam_id: str, raw_roi) -> tuple[int, int, int, int] | None:
-    """Validate an optional [x, y, width, height] crop box from the TOML."""
-    if raw_roi is None:
-        return None
-    if not isinstance(raw_roi, (list, tuple)) or len(raw_roi) != 4:
-        raise ValueError(
-            f"Camera '{cam_id}' roi must be a 4-element [x, y, width, height]."
-        )
-    x, y, w, h = (int(v) for v in raw_roi)
-    if x < 0 or y < 0 or w <= 0 or h <= 0:
-        raise ValueError(
-            f"Camera '{cam_id}' roi needs x,y >= 0 and width,height > 0."
-        )
-    return (x, y, w, h)
-
-
-def _parse_undistort(cam_id: str, raw) -> tuple[float, float, float] | None:
-    """Validate an optional [k1, k2, focal_ratio] undistortion triple."""
-    if raw is None:
-        return None
-    if not isinstance(raw, (list, tuple)) or len(raw) != 3:
-        raise ValueError(
-            f"Camera '{cam_id}' undistort must be [k1, k2, focal_ratio]."
-        )
-    k1, k2, f = (float(v) for v in raw)
-    if f <= 0:
-        raise ValueError(f"Camera '{cam_id}' undistort focal_ratio must be > 0.")
-    return (k1, k2, f)
-
-
 def load_config(path: Path | None = None) -> Config:
     """Read and validate the TOML file, returning a :class:`Config`.
 
     Raises ``FileNotFoundError`` if the file is missing and ``ValueError``
-    if its contents are invalid, so startup aborts loudly instead of the
-    node running with a broken/empty camera list.
+    if its contents are invalid, so startup aborts loudly rather than
+    running with a broken/empty camera list.
     """
     path = path or config_path()
     if not path.is_file():
@@ -119,8 +116,7 @@ def load_config(path: Path | None = None) -> Config:
             f"with [server] and [[cameras]] entries."
         )
 
-    # tomllib requires the file to be opened in binary mode.
-    with path.open("rb") as fh:
+    with path.open("rb") as fh:  # tomllib requires binary mode
         raw = tomllib.load(fh)
 
     # [server] is optional; fall back to the dataclass defaults per field.
@@ -150,18 +146,19 @@ def load_config(path: Path | None = None) -> Config:
                 url=url,
                 name=str(entry.get("name", "")).strip(),
                 max_frame_age_s=float(entry.get("max_frame_age_s", 0.0)),
-                roi=_parse_roi(cam_id, entry.get("roi")),
+                roi=parse_roi(cam_id, entry.get("roi")),
                 rotate=float(entry.get("rotate", 0.0)),
-                undistort=_parse_undistort(cam_id, entry.get("undistort")),
+                undistort=parse_undistort(cam_id, entry.get("undistort")),
             )
         )
 
-    # A node with no cameras can't do anything useful; refuse to start.
     if not cameras:
         raise ValueError("No cameras configured: add at least one [[cameras]] entry.")
 
     return Config(server=server, cameras=cameras)
 
+
+# --- write --------------------------------------------------------------------
 
 def update_camera_in_file(
     camera_id: str,
@@ -171,13 +168,14 @@ def update_camera_in_file(
     undistort: tuple[float, float, float] | None = None,
     path: Path | None = None,
 ) -> None:
-    """Persist ``rotate``, ``roi`` and/or ``undistort`` for one camera back
-    to the TOML file, preserving comments and formatting.
+    """Persist ``rotate``/``roi``/``undistort`` for one camera back to the
+    TOML file, preserving comments and formatting.
 
-    Uses tomlkit (imported lazily so the read path never depends on it).
-    Raises KeyError if the camera id is not present in the file.
+    Only the keyword arguments that are not None are written. Uses tomlkit,
+    imported lazily so the read path never depends on it. Raises KeyError if
+    the camera id is not present in the file.
     """
-    import tomlkit
+    import tomlkit  # only needed for writing; keeps the read path dependency-free
 
     path = path or config_path()
     doc = tomlkit.parse(path.read_text(encoding="utf-8"))
@@ -190,6 +188,6 @@ def update_camera_in_file(
             if undistort is not None:
                 entry["undistort"] = list(undistort)
             break
-    else:
+    else:  # for/else: ran without `break` -> id never matched
         raise KeyError(f"Camera '{camera_id}' not found in {path}")
     path.write_text(tomlkit.dumps(doc), encoding="utf-8")
