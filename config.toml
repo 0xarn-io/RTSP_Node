@@ -15,9 +15,9 @@ max_frame_age_s = 0.0
 # Lens undistort [k1, k2, focal_ratio]; k1=k2=0 means no correction.
 undistort = [-0.4, -0.05, 1]
 # Rotate the full frame this many degrees (CCW) before cropping (0 = none).
-rotate = -13.0
+rotate = -9.0
 # Crop box [x, y, width, height] in pixels; this one yields 832x832 output.
-roi = [120, 50, 832, 832]
+roi = [100, 50, 832, 832]
 
 [[cameras]]
 id = "Exit"
