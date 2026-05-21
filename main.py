@@ -275,7 +275,15 @@ _SETUP_PAGE = """<!doctype html>
   Rotation (deg, CCW):
   <input type="number" id="angle" step="0.5" value="__ROTATE__">
   <button id="apply">Apply / refresh frame</button>
-  <span class="muted">Drag on the image to draw the ROI; drag again to replace it.</span>
+</div>
+<div class="row">
+  ROI:
+  x <input type="number" id="rx" min="0">
+  y <input type="number" id="ry" min="0">
+  w <input type="number" id="rw" min="1">
+  h <input type="number" id="rh" min="1">
+  <button id="applyroi">Set ROI</button>
+  <span class="muted">&hellip; or drag a box on the image.</span>
 </div>
 <div class="cols">
   <div>
@@ -299,21 +307,50 @@ const out = document.getElementById('out');
 const outsize = document.getElementById('outsize');
 const frameinfo = document.getElementById('frameinfo');
 const preview = document.getElementById('preview');
+const rx = document.getElementById('rx');
+const ry = document.getElementById('ry');
+const rw = document.getElementById('rw');
+const rh = document.getElementById('rh');
+const initialRoi = __ROI_JS__;  // [x, y, w, h] from config, or null
 let roi = null;  // [x, y, w, h] in natural pixels
 
 function loadFrame() {
   const a = parseFloat(angleEl.value) || 0;
   img.onload = () => {
     frameinfo.textContent = `frame ${img.naturalWidth}x${img.naturalHeight} (rotated ${a} deg)`;
-    if (roi) drawPreview();
+    if (!roi && initialRoi) setRoi(initialRoi[0], initialRoi[1], initialRoi[2], initialRoi[3]);
+    else if (roi) { drawBox(); drawPreview(); }
     render();
   };
   img.onerror = () => { frameinfo.textContent = 'no frame yet - is the camera connected?'; };
   img.src = `/cameras/${encodeURIComponent(camId)}/frame?rotate=${a}&_=${Date.now()}`;
 }
 
-function natScale() {
-  return { x: img.naturalWidth / img.clientWidth, y: img.naturalHeight / img.clientHeight };
+function clampRoi(x, y, w, h) {
+  const W = img.naturalWidth, H = img.naturalHeight;
+  x = Math.max(0, Math.min(Math.round(x), W - 1));
+  y = Math.max(0, Math.min(Math.round(y), H - 1));
+  w = Math.max(1, Math.min(Math.round(w), W - x));
+  h = Math.max(1, Math.min(Math.round(h), H - y));
+  return [x, y, w, h];
+}
+
+function setRoi(x, y, w, h) {
+  if (!img.naturalWidth) return;  // no frame loaded yet
+  roi = clampRoi(x, y, w, h);
+  rx.value = roi[0]; ry.value = roi[1]; rw.value = roi[2]; rh.value = roi[3];
+  drawBox(); drawPreview(); render();
+}
+
+function drawBox() {
+  if (!roi) { box.style.display = 'none'; return; }
+  const sx = img.clientWidth / img.naturalWidth;
+  const sy = img.clientHeight / img.naturalHeight;
+  box.style.display = 'block';
+  box.style.left = (roi[0] * sx) + 'px';
+  box.style.top = (roi[1] * sy) + 'px';
+  box.style.width = (roi[2] * sx) + 'px';
+  box.style.height = (roi[3] * sy) + 'px';
 }
 
 let dragging = false, sx = 0, sy = 0;
@@ -339,18 +376,14 @@ stage.addEventListener('pointermove', (e) => {
 stage.addEventListener('pointerup', () => {
   if (!dragging) return;
   dragging = false;
-  const s = natScale();
-  let x = Math.round(parseFloat(box.style.left) * s.x);
-  let y = Math.round(parseFloat(box.style.top) * s.y);
-  let w = Math.round(parseFloat(box.style.width) * s.x);
-  let h = Math.round(parseFloat(box.style.height) * s.y);
-  x = Math.max(0, Math.min(x, img.naturalWidth));
-  y = Math.max(0, Math.min(y, img.naturalHeight));
-  w = Math.max(1, Math.min(w, img.naturalWidth - x));
-  h = Math.max(1, Math.min(h, img.naturalHeight - y));
-  roi = [x, y, w, h];
-  drawPreview();
-  render();
+  const fx = img.naturalWidth / img.clientWidth;
+  const fy = img.naturalHeight / img.clientHeight;
+  setRoi(
+    parseFloat(box.style.left) * fx,
+    parseFloat(box.style.top) * fy,
+    parseFloat(box.style.width) * fx,
+    parseFloat(box.style.height) * fy
+  );
 });
 
 function drawPreview() {
@@ -372,6 +405,10 @@ function render() {
 }
 
 document.getElementById('apply').addEventListener('click', loadFrame);
+document.getElementById('applyroi').addEventListener('click', () => {
+  setRoi(parseInt(rx.value) || 0, parseInt(ry.value) || 0,
+         parseInt(rw.value) || 1, parseInt(rh.value) || 1);
+});
 loadFrame();
 </script>
 </body>
@@ -381,9 +418,11 @@ loadFrame();
 @app.get("/cameras/{camera_id}/setup", response_class=HTMLResponse)
 def setup_tool(camera: CameraWorker = Depends(get_camera)):
     """Serve the on-demand ROI + rotate setup page for one camera."""
+    roi_js = json.dumps(list(camera.cam.roi) if camera.cam.roi else None)
     page = (
         _SETUP_PAGE
         .replace("__CAMERA_ID_JS__", json.dumps(camera.cam.id))
+        .replace("__ROI_JS__", roi_js)
         .replace("__CAMERA_ID__", html.escape(camera.cam.id))
         .replace("__ROTATE__", str(camera.cam.rotate))
     )
