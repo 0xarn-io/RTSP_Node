@@ -13,9 +13,9 @@ url = "rtsp://192.168.125.50:554"
 # Optional: refuse to serve frames older than this many seconds (0 = disabled).
 max_frame_age_s = 0.0
 # Rotate the full frame this many degrees (CCW) before cropping (0 = none).
-rotate = 0.0
+rotate = -13.0
 # Crop box [x, y, width, height] in pixels; this one yields 832x832 output.
-roi = [826, 345, 832, 832]
+roi = [120, 50, 832, 832]
 
 [[cameras]]
 id = "Exit"
