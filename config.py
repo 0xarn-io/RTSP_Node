@@ -40,6 +40,11 @@ class CameraConfig:
     # applied to the full frame BEFORE the roi crop — use it to level or
     # orient a tilted camera. 0 = no rotation.
     rotate: float = 0.0
+    # Optional lens undistortion [k1, k2, focal_ratio]: k1/k2 are radial
+    # distortion coefficients and focal_ratio is the focal length as a
+    # fraction of frame width. Applied to the full frame FIRST, before
+    # rotate and crop. None (or k1=k2=0) means no correction.
+    undistort: tuple[float, float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -83,6 +88,20 @@ def _parse_roi(cam_id: str, raw_roi) -> tuple[int, int, int, int] | None:
             f"Camera '{cam_id}' roi needs x,y >= 0 and width,height > 0."
         )
     return (x, y, w, h)
+
+
+def _parse_undistort(cam_id: str, raw) -> tuple[float, float, float] | None:
+    """Validate an optional [k1, k2, focal_ratio] undistortion triple."""
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)) or len(raw) != 3:
+        raise ValueError(
+            f"Camera '{cam_id}' undistort must be [k1, k2, focal_ratio]."
+        )
+    k1, k2, f = (float(v) for v in raw)
+    if f <= 0:
+        raise ValueError(f"Camera '{cam_id}' undistort focal_ratio must be > 0.")
+    return (k1, k2, f)
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -133,6 +152,7 @@ def load_config(path: Path | None = None) -> Config:
                 max_frame_age_s=float(entry.get("max_frame_age_s", 0.0)),
                 roi=_parse_roi(cam_id, entry.get("roi")),
                 rotate=float(entry.get("rotate", 0.0)),
+                undistort=_parse_undistort(cam_id, entry.get("undistort")),
             )
         )
 
@@ -148,10 +168,11 @@ def update_camera_in_file(
     *,
     rotate: float | None = None,
     roi: tuple[int, int, int, int] | None = None,
+    undistort: tuple[float, float, float] | None = None,
     path: Path | None = None,
 ) -> None:
-    """Persist ``rotate`` and/or ``roi`` for one camera back to the TOML
-    file, preserving comments and formatting.
+    """Persist ``rotate``, ``roi`` and/or ``undistort`` for one camera back
+    to the TOML file, preserving comments and formatting.
 
     Uses tomlkit (imported lazily so the read path never depends on it).
     Raises KeyError if the camera id is not present in the file.
@@ -166,6 +187,8 @@ def update_camera_in_file(
                 entry["rotate"] = rotate
             if roi is not None:
                 entry["roi"] = list(roi)
+            if undistort is not None:
+                entry["undistort"] = list(undistort)
             break
     else:
         raise KeyError(f"Camera '{camera_id}' not found in {path}")

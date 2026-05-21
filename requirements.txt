@@ -1,5 +1,6 @@
 fastapi>=0.115
 uvicorn[standard]>=0.30
 opencv-python-headless>=4.10
+numpy>=1.24
 piexif>=1.1
 tomlkit>=0.13

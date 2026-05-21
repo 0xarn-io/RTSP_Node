@@ -21,6 +21,7 @@ from dataclasses import replace
 from typing import Optional
 
 import cv2
+import numpy as np
 
 from config import CameraConfig
 
@@ -53,6 +54,28 @@ def rotate_image(frame, degrees: float):
     h, w = frame.shape[:2]
     matrix = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), degrees, 1.0)
     return cv2.warpAffine(frame, matrix, (w, h))
+
+
+def undistort_image(frame, undistort):
+    """Correct lens (barrel/fisheye) distortion with a simple radial model.
+
+    ``undistort`` is ``(k1, k2, focal_ratio)`` or None. The camera matrix is
+    assumed centered with focal length ``focal_ratio * frame_width``; k1/k2
+    are the radial distortion coefficients. Output keeps the input WxH.
+    Returns the input unchanged when there's nothing to correct (k1==k2==0).
+    """
+    if undistort is None:
+        return frame
+    k1, k2, f_ratio = undistort
+    if k1 == 0.0 and k2 == 0.0:
+        return frame
+    h, w = frame.shape[:2]
+    f = f_ratio * w
+    camera_matrix = np.array([[f, 0.0, w / 2.0],
+                              [0.0, f, h / 2.0],
+                              [0.0, 0.0, 1.0]])
+    dist = np.array([k1, k2, 0.0, 0.0, 0.0])
+    return cv2.undistort(frame, camera_matrix, dist)
 
 
 class CameraWorker:
@@ -191,8 +214,10 @@ class CameraWorker:
         # The capture thread only ever rebinds self._frame to a brand-new
         # array (it never mutates one in place), so it is safe to transform
         # this grabbed reference after releasing the lock.
-        # Rotate the full frame first, then crop — the ROI is defined in
-        # rotated-frame coordinates (exactly what the setup tool shows).
+        # Pipeline order: undistort the lens first, then rotate to level,
+        # then crop the ROI (which is defined in undistorted+rotated
+        # coordinates, exactly what the setup tool shows you).
+        frame = undistort_image(frame, self.cam.undistort)
         frame = rotate_image(frame, self.cam.rotate)
         if self.cam.roi is None:
             return frame.copy(), ts
@@ -219,15 +244,18 @@ class CameraWorker:
             return self._frame.copy(), self._frame_ts
 
     def update_config(self, *, rotate: float | None = None,
-                      roi: tuple[int, int, int, int] | None = None) -> None:
-        """Live-swap this worker's rotation/ROI by replacing the frozen
-        CameraConfig. snapshot() picks it up on its next call, since the
-        whole self.cam object is reassigned in one atomic step."""
+                      roi: tuple[int, int, int, int] | None = None,
+                      undistort: tuple[float, float, float] | None = None) -> None:
+        """Live-swap this worker's rotation/ROI/undistort by replacing the
+        frozen CameraConfig. snapshot() picks it up on its next call, since
+        the whole self.cam object is reassigned in one atomic step."""
         changes = {}
         if rotate is not None:
             changes["rotate"] = rotate
         if roi is not None:
             changes["roi"] = roi
+        if undistort is not None:
+            changes["undistort"] = undistort
         if changes:
             self.cam = replace(self.cam, **changes)
 
@@ -252,6 +280,9 @@ class CameraWorker:
             info["resolution"] = {"width": int(shape[1]), "height": int(shape[0])}
         if self.cam.rotate:
             info["rotate"] = self.cam.rotate
+        if self.cam.undistort is not None and (self.cam.undistort[0] or self.cam.undistort[1]):
+            k1, k2, f = self.cam.undistort
+            info["undistort"] = {"k1": k1, "k2": k2, "f": f}
         if self.cam.roi is not None:
             x, y, w, h = self.cam.roi
             info["roi"] = {"x": x, "y": y, "width": w, "height": h}

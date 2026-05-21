@@ -21,8 +21,8 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from camera import CameraManager, CameraWorker, rotate_image
-from config import _parse_roi, load_config, update_camera_in_file
+from camera import CameraManager, CameraWorker, rotate_image, undistort_image
+from config import _parse_roi, _parse_undistort, load_config, update_camera_in_file
 
 logging.basicConfig(
     level=logging.INFO,
@@ -216,9 +216,12 @@ def screenshot(
 def raw_frame(
     camera: CameraWorker = Depends(get_camera),
     rotate: float = Query(0.0, description="Rotate the full frame this many degrees (CCW) before encoding."),
+    k1: float = Query(0.0, description="Radial distortion k1 for the undistortion preview."),
+    k2: float = Query(0.0, description="Radial distortion k2 for the undistortion preview."),
+    f: float = Query(1.0, gt=0, description="Focal length as a fraction of frame width."),
     quality: int = Query(90, ge=1, le=100, description="JPEG quality (1-100)"),
 ):
-    """The full, *uncropped* frame as JPEG, optionally rotated.
+    """The full, *uncropped* frame as JPEG: undistorted, then rotated.
 
     Backs the setup tool: you draw the ROI on exactly the image the server
     would crop. 404 = unknown camera, 503 = no frame yet, 500 = encode error.
@@ -230,6 +233,7 @@ def raw_frame(
             detail=f"No frame available yet for camera '{camera.cam.id}'.",
         )
     frame, _ = raw
+    frame = undistort_image(frame, (k1, k2, f))
     frame = rotate_image(frame, rotate)
     ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
     if not ok:
@@ -278,6 +282,13 @@ _SETUP_PAGE = """<!doctype html>
   <button id="apply">Apply / refresh frame</button>
 </div>
 <div class="row">
+  Lens undistort:
+  k1 <input type="number" id="k1" step="0.01" value="__K1__">
+  k2 <input type="number" id="k2" step="0.01" value="__K2__">
+  f <input type="number" id="f" step="0.05" min="0.05" value="__F__">
+  <span class="muted">tweak, then &ldquo;Apply / refresh frame&rdquo; until straight lines look straight.</span>
+</div>
+<div class="row">
   ROI:
   x <input type="number" id="rx" min="0">
   y <input type="number" id="ry" min="0">
@@ -317,11 +328,23 @@ const ry = document.getElementById('ry');
 const rw = document.getElementById('rw');
 const rh = document.getElementById('rh');
 const applymsg = document.getElementById('applymsg');
+const k1El = document.getElementById('k1');
+const k2El = document.getElementById('k2');
+const fEl = document.getElementById('f');
 const initialRoi = __ROI_JS__;  // [x, y, w, h] from config, or null
 let roi = null;  // [x, y, w, h] in natural pixels
 
+function lensParams() {
+  return {
+    k1: parseFloat(k1El.value) || 0,
+    k2: parseFloat(k2El.value) || 0,
+    f: parseFloat(fEl.value) || 1,
+  };
+}
+
 function loadFrame() {
   const a = parseFloat(angleEl.value) || 0;
+  const p = lensParams();
   img.onload = () => {
     frameinfo.textContent = `frame ${img.naturalWidth}x${img.naturalHeight} (rotated ${a} deg)`;
     if (!roi && initialRoi) setRoi(initialRoi[0], initialRoi[1], initialRoi[2], initialRoi[3]);
@@ -329,7 +352,7 @@ function loadFrame() {
     render();
   };
   img.onerror = () => { frameinfo.textContent = 'no frame yet - is the camera connected?'; };
-  img.src = `/cameras/${encodeURIComponent(camId)}/frame?rotate=${a}&_=${Date.now()}`;
+  img.src = `/cameras/${encodeURIComponent(camId)}/frame?rotate=${a}&k1=${p.k1}&k2=${p.k2}&f=${p.f}&_=${Date.now()}`;
 }
 
 function clampRoi(x, y, w, h) {
@@ -400,7 +423,9 @@ function drawPreview() {
 
 function render() {
   const a = parseFloat(angleEl.value) || 0;
+  const p = lensParams();
   let text = `rotate = ${a}`;
+  if (p.k1 || p.k2) text += `\\nundistort = [${p.k1}, ${p.k2}, ${p.f}]`;
   if (roi) {
     text += `\\nroi = [${roi[0]}, ${roi[1]}, ${roi[2]}, ${roi[3]}]`;
     outsize.textContent = `${roi[2]}x${roi[3]}`;
@@ -416,7 +441,8 @@ document.getElementById('applyroi').addEventListener('click', () => {
          parseInt(rw.value) || 1, parseInt(rh.value) || 1);
 });
 document.getElementById('applycfg').addEventListener('click', async () => {
-  const payload = { rotate: parseFloat(angleEl.value) || 0 };
+  const p = lensParams();
+  const payload = { rotate: parseFloat(angleEl.value) || 0, undistort: [p.k1, p.k2, p.f] };
   if (roi) payload.roi = roi;
   applymsg.textContent = 'applying...';
   try {
@@ -443,12 +469,16 @@ loadFrame();
 def setup_tool(camera: CameraWorker = Depends(get_camera)):
     """Serve the on-demand ROI + rotate setup page for one camera."""
     roi_js = json.dumps(list(camera.cam.roi) if camera.cam.roi else None)
+    und = camera.cam.undistort or (0.0, 0.0, 1.0)
     page = (
         _SETUP_PAGE
         .replace("__CAMERA_ID_JS__", json.dumps(camera.cam.id))
         .replace("__ROI_JS__", roi_js)
         .replace("__CAMERA_ID__", html.escape(camera.cam.id))
         .replace("__ROTATE__", str(camera.cam.rotate))
+        .replace("__K1__", str(und[0]))
+        .replace("__K2__", str(und[1]))
+        .replace("__F__", str(und[2]))
     )
     return HTMLResponse(content=page)
 
@@ -457,25 +487,27 @@ class ConfigUpdate(BaseModel):
     """Body for POST /cameras/{id}/config (sent by the setup tool)."""
     rotate: float = 0.0
     roi: list[int] | None = None  # [x, y, width, height]; omit to leave unchanged
+    undistort: list[float] | None = None  # [k1, k2, focal_ratio]; omit to leave unchanged
 
 
 @app.post("/cameras/{camera_id}/config")
 def update_camera_config(body: ConfigUpdate, camera: CameraWorker = Depends(get_camera)):
-    """Apply rotate/roi to a running camera and persist them to config.toml.
+    """Apply rotate/roi/undistort to a running camera and persist to config.toml.
 
-    Powers the setup tool's "Apply" button. 422 = invalid roi, 500 = the
-    live update succeeded conceptually but writing config.toml failed.
+    Powers the setup tool's "Apply" button. 422 = invalid roi/undistort,
+    500 = the live update succeeded conceptually but writing config.toml failed.
     """
     try:
         roi = _parse_roi(camera.cam.id, body.roi)
+        undistort = _parse_undistort(camera.cam.id, body.undistort)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     # Persist first, so a write failure leaves the running config untouched.
     try:
-        update_camera_in_file(camera.cam.id, rotate=body.rotate, roi=roi)
+        update_camera_in_file(camera.cam.id, rotate=body.rotate, roi=roi, undistort=undistort)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to write config: {exc}")
-    camera.update_config(rotate=body.rotate, roi=roi)
+    camera.update_config(rotate=body.rotate, roi=roi, undistort=undistort)
     return camera.status()
 
 
