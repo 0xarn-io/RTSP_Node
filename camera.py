@@ -58,7 +58,6 @@ class CameraWorker:
         self._connected = False  # True while the RTSP stream is open
         self._stop = threading.Event()  # set() asks the capture loop to stop
         self._thread: Optional[threading.Thread] = None
-        self._roi_warned = False  # so an out-of-bounds ROI logs only once
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -162,7 +161,8 @@ class CameraWorker:
         lock or racing the capture thread's next write. Honors
         ``max_frame_age_s``: a frame older than the configured limit is
         treated as unavailable (stale/frozen stream). If the camera has an
-        ``roi`` configured, the returned frame is cropped to that box.
+        ``roi`` configured, the returned frame is cropped to that box, and
+        a ``ValueError`` is raised if the ROI exceeds the frame.
         """
         with self._lock:
             if self._frame is None:
@@ -180,20 +180,17 @@ class CameraWorker:
         if self.cam.roi is None:
             return frame.copy(), ts
         x, y, w, h = self.cam.roi
-        cropped = frame[y:y + h, x:x + w]
-        # numpy silently clips an out-of-bounds slice, so the crop can come
-        # back smaller than requested; warn once if the camera's resolution
-        # can't satisfy the ROI.
-        if (cropped.shape[1], cropped.shape[0]) != (w, h) and not self._roi_warned:
-            self._roi_warned = True
-            logger.warning(
-                "camera %s: ROI x=%d y=%d %dx%d exceeds frame %dx%d; "
-                "output cropped to %dx%d",
-                self.cam.id, x, y, w, h,
-                frame.shape[1], frame.shape[0],
-                cropped.shape[1], cropped.shape[0],
+        fh, fw = frame.shape[:2]
+        # Same crop convention as the downstream vision.crop_to_roi:
+        # img[y:y+h, x:x+w]. A ROI that runs past the frame is an error,
+        # not something to silently clip — a wrong-sized crop would corrupt
+        # a fixed-input CNN, so fail loudly instead.
+        if x + w > fw or y + h > fh:
+            raise ValueError(
+                f"camera {self.cam.id}: ROI x={x} y={y} {w}x{h} exceeds "
+                f"frame {fw}x{fh}"
             )
-        return cropped.copy(), ts
+        return frame[y:y + h, x:x + w].copy(), ts
 
     def status(self) -> dict:
         """Snapshot of this camera's state for the status/health endpoints."""
