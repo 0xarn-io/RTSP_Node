@@ -12,6 +12,8 @@ name = "Entry"
 url = "rtsp://192.168.125.50:554"
 # Optional: refuse to serve frames older than this many seconds (0 = disabled).
 max_frame_age_s = 0.0
+# Crop box [x, y, width, height] in pixels; this one yields 832x832 output.
+roi = [826, 345, 832, 832]
 
 [[cameras]]
 id = "Exit"
@@ -19,3 +21,5 @@ name = "Exit"
 url = "rtsp://192.168.125.51:554"
 # Optional: refuse to serve frames older than this many seconds (0 = disabled).
 max_frame_age_s = 0.0
+# Crop box [x, y, width, height] in pixels; this one yields 832x832 output.
+roi = [826, 345, 832, 832]

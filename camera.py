@@ -160,7 +160,9 @@ class CameraWorker:
         Returns a *copy* so the caller can encode it without holding the
         lock or racing the capture thread's next write. Honors
         ``max_frame_age_s``: a frame older than the configured limit is
-        treated as unavailable (stale/frozen stream).
+        treated as unavailable (stale/frozen stream). If the camera has an
+        ``roi`` configured, the returned frame is cropped to that box, and
+        a ``ValueError`` is raised if the ROI exceeds the frame.
         """
         with self._lock:
             if self._frame is None:
@@ -168,7 +170,27 @@ class CameraWorker:
             age = time.time() - self._frame_ts
             if self.cam.max_frame_age_s and age > self.cam.max_frame_age_s:
                 return None
-            return self._frame.copy(), self._frame_ts
+            frame = self._frame
+            ts = self._frame_ts
+
+        # The capture thread only ever rebinds self._frame to a brand-new
+        # array (it never mutates one in place), so it is safe to crop this
+        # grabbed reference after releasing the lock — and cropping first
+        # lets us copy just the ROI instead of the whole frame.
+        if self.cam.roi is None:
+            return frame.copy(), ts
+        x, y, w, h = self.cam.roi
+        fh, fw = frame.shape[:2]
+        # Same crop convention as the downstream vision.crop_to_roi:
+        # img[y:y+h, x:x+w]. A ROI that runs past the frame is an error,
+        # not something to silently clip — a wrong-sized crop would corrupt
+        # a fixed-input CNN, so fail loudly instead.
+        if x + w > fw or y + h > fh:
+            raise ValueError(
+                f"camera {self.cam.id}: ROI x={x} y={y} {w}x{h} exceeds "
+                f"frame {fw}x{fh}"
+            )
+        return frame[y:y + h, x:x + w].copy(), ts
 
     def status(self) -> dict:
         """Snapshot of this camera's state for the status/health endpoints."""
@@ -189,6 +211,16 @@ class CameraWorker:
             info["last_frame_age_s"] = round(time.time() - ts, 3)
             # frame.shape is (height, width, channels) for a color image.
             info["resolution"] = {"width": int(shape[1]), "height": int(shape[0])}
+        if self.cam.roi is not None:
+            x, y, w, h = self.cam.roi
+            info["roi"] = {"x": x, "y": y, "width": w, "height": h}
+            if has_frame:
+                # The size actually served, after clipping the ROI to the
+                # frame — lets a client confirm it gets e.g. 832x832.
+                info["output_resolution"] = {
+                    "width": max(0, min(x + w, int(shape[1])) - x),
+                    "height": max(0, min(y + h, int(shape[0])) - y),
+                }
         return info
 
 

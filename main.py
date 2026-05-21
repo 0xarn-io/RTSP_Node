@@ -143,8 +143,9 @@ def screenshot(
     """Return the camera's latest frame as a JPEG image.
 
     404 = unknown camera (from get_camera), 503 = connected/connecting but
-    no frame captured yet, 500 = the frame failed to JPEG-encode,
-    400 = the supplied ``uuid`` is not a valid hex UUID.
+    no frame captured yet, 500 = the frame failed to JPEG-encode or the
+    configured ROI exceeds the frame, 400 = the supplied ``uuid`` is not a
+    valid hex UUID.
     Frame metadata is returned in ``X-Frame-*`` response headers so clients
     can read it without decoding the image. If ``uuid`` is provided it is
     also written into the JPEG's EXIF so the identifier travels with the
@@ -160,7 +161,12 @@ def screenshot(
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail=f"Invalid UUID: {uuid!r}")
 
-    snap = camera.snapshot()
+    try:
+        snap = camera.snapshot()
+    except ValueError as exc:
+        # The configured ROI doesn't fit the camera's frame (resolution
+        # mismatch) — surface it instead of serving a wrong-sized image.
+        raise HTTPException(status_code=500, detail=str(exc))
     if snap is None:
         raise HTTPException(
             status_code=503,
