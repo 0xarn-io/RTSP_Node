@@ -13,7 +13,7 @@ url = "rtsp://192.168.125.50:554"
 # Optional: refuse to serve frames older than this many seconds (0 = disabled).
 max_frame_age_s = 0.0
 # Lens undistort [k1, k2, focal_ratio]; k1=k2=0 means no correction.
-undistort = [0.0, 0.0, 1.0]
+undistort = [-0.4, -0.05, 1]
 # Rotate the full frame this many degrees (CCW) before cropping (0 = none).
 rotate = -13.0
 # Crop box [x, y, width, height] in pixels; this one yields 832x832 output.
