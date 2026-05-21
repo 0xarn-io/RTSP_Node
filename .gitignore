@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venvpkgs/
+.venv/
+venv/
+
+# Visual Studio IDE state
+.vs/
