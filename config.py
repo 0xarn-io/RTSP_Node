@@ -32,6 +32,10 @@ class CameraConfig:
     # If > 0, a frame older than this many seconds is treated as missing
     # (protects against serving a stale image from a frozen stream).
     max_frame_age_s: float = 0.0
+    # Optional crop box [x, y, width, height] in pixels. When set, served
+    # screenshots are cropped to this region (e.g. [826, 345, 832, 832]
+    # yields 832x832 images). None = serve the full frame.
+    roi: tuple[int, int, int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -59,6 +63,22 @@ class Config:
 def config_path() -> Path:
     """Resolve which file to load: the env override, else the default."""
     return Path(os.environ.get(CONFIG_ENV_VAR, DEFAULT_CONFIG_PATH))
+
+
+def _parse_roi(cam_id: str, raw_roi) -> tuple[int, int, int, int] | None:
+    """Validate an optional [x, y, width, height] crop box from the TOML."""
+    if raw_roi is None:
+        return None
+    if not isinstance(raw_roi, (list, tuple)) or len(raw_roi) != 4:
+        raise ValueError(
+            f"Camera '{cam_id}' roi must be a 4-element [x, y, width, height]."
+        )
+    x, y, w, h = (int(v) for v in raw_roi)
+    if x < 0 or y < 0 or w <= 0 or h <= 0:
+        raise ValueError(
+            f"Camera '{cam_id}' roi needs x,y >= 0 and width,height > 0."
+        )
+    return (x, y, w, h)
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -107,6 +127,7 @@ def load_config(path: Path | None = None) -> Config:
                 url=url,
                 name=str(entry.get("name", "")).strip(),
                 max_frame_age_s=float(entry.get("max_frame_age_s", 0.0)),
+                roi=_parse_roi(cam_id, entry.get("roi")),
             )
         )
 

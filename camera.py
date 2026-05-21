@@ -58,6 +58,7 @@ class CameraWorker:
         self._connected = False  # True while the RTSP stream is open
         self._stop = threading.Event()  # set() asks the capture loop to stop
         self._thread: Optional[threading.Thread] = None
+        self._roi_warned = False  # so an out-of-bounds ROI logs only once
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -160,7 +161,8 @@ class CameraWorker:
         Returns a *copy* so the caller can encode it without holding the
         lock or racing the capture thread's next write. Honors
         ``max_frame_age_s``: a frame older than the configured limit is
-        treated as unavailable (stale/frozen stream).
+        treated as unavailable (stale/frozen stream). If the camera has an
+        ``roi`` configured, the returned frame is cropped to that box.
         """
         with self._lock:
             if self._frame is None:
@@ -168,7 +170,30 @@ class CameraWorker:
             age = time.time() - self._frame_ts
             if self.cam.max_frame_age_s and age > self.cam.max_frame_age_s:
                 return None
-            return self._frame.copy(), self._frame_ts
+            frame = self._frame
+            ts = self._frame_ts
+
+        # The capture thread only ever rebinds self._frame to a brand-new
+        # array (it never mutates one in place), so it is safe to crop this
+        # grabbed reference after releasing the lock — and cropping first
+        # lets us copy just the ROI instead of the whole frame.
+        if self.cam.roi is None:
+            return frame.copy(), ts
+        x, y, w, h = self.cam.roi
+        cropped = frame[y:y + h, x:x + w]
+        # numpy silently clips an out-of-bounds slice, so the crop can come
+        # back smaller than requested; warn once if the camera's resolution
+        # can't satisfy the ROI.
+        if (cropped.shape[1], cropped.shape[0]) != (w, h) and not self._roi_warned:
+            self._roi_warned = True
+            logger.warning(
+                "camera %s: ROI x=%d y=%d %dx%d exceeds frame %dx%d; "
+                "output cropped to %dx%d",
+                self.cam.id, x, y, w, h,
+                frame.shape[1], frame.shape[0],
+                cropped.shape[1], cropped.shape[0],
+            )
+        return cropped.copy(), ts
 
     def status(self) -> dict:
         """Snapshot of this camera's state for the status/health endpoints."""
@@ -189,6 +214,16 @@ class CameraWorker:
             info["last_frame_age_s"] = round(time.time() - ts, 3)
             # frame.shape is (height, width, channels) for a color image.
             info["resolution"] = {"width": int(shape[1]), "height": int(shape[0])}
+        if self.cam.roi is not None:
+            x, y, w, h = self.cam.roi
+            info["roi"] = {"x": x, "y": y, "width": w, "height": h}
+            if has_frame:
+                # The size actually served, after clipping the ROI to the
+                # frame — lets a client confirm it gets e.g. 832x832.
+                info["output_resolution"] = {
+                    "width": max(0, min(x + w, int(shape[1])) - x),
+                    "height": max(0, min(y + h, int(shape[0])) - y),
+                }
         return info
 
 
