@@ -36,6 +36,10 @@ class CameraConfig:
     # screenshots are cropped to this region (e.g. [826, 345, 832, 832]
     # yields 832x832 images). None = serve the full frame.
     roi: tuple[int, int, int, int] | None = None
+    # Optional rotation in degrees (counter-clockwise, OpenCV convention)
+    # applied to the full frame BEFORE the roi crop — use it to level or
+    # orient a tilted camera. 0 = no rotation.
+    rotate: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -128,6 +132,7 @@ def load_config(path: Path | None = None) -> Config:
                 name=str(entry.get("name", "")).strip(),
                 max_frame_age_s=float(entry.get("max_frame_age_s", 0.0)),
                 roi=_parse_roi(cam_id, entry.get("roi")),
+                rotate=float(entry.get("rotate", 0.0)),
             )
         )
 

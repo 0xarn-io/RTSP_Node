@@ -40,6 +40,20 @@ _RECONNECT_BACKOFF_MAX_S = 30.0
 _MAX_READ_FAILURES = 30
 
 
+def rotate_image(frame, degrees: float):
+    """Rotate a BGR frame about its center, keeping the original width and
+    height. Positive ``degrees`` rotate counter-clockwise (OpenCV
+    convention). The canvas size is preserved so ROI coordinates stay in a
+    stable space regardless of angle; corners exposed by the rotation are
+    filled black. Returns the input unchanged when ``degrees`` is 0.
+    """
+    if not degrees:
+        return frame
+    h, w = frame.shape[:2]
+    matrix = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), degrees, 1.0)
+    return cv2.warpAffine(frame, matrix, (w, h))
+
+
 class CameraWorker:
     """Owns one RTSP connection in a background thread, always holding the
     latest decoded frame so screenshots are served without per-request
@@ -160,9 +174,9 @@ class CameraWorker:
         Returns a *copy* so the caller can encode it without holding the
         lock or racing the capture thread's next write. Honors
         ``max_frame_age_s``: a frame older than the configured limit is
-        treated as unavailable (stale/frozen stream). If the camera has an
-        ``roi`` configured, the returned frame is cropped to that box, and
-        a ``ValueError`` is raised if the ROI exceeds the frame.
+        treated as unavailable (stale/frozen stream). The configured
+        ``rotate`` is applied to the full frame first, then the ``roi`` crop;
+        a ``ValueError`` is raised if the ROI exceeds the (rotated) frame.
         """
         with self._lock:
             if self._frame is None:
@@ -174,9 +188,11 @@ class CameraWorker:
             ts = self._frame_ts
 
         # The capture thread only ever rebinds self._frame to a brand-new
-        # array (it never mutates one in place), so it is safe to crop this
-        # grabbed reference after releasing the lock — and cropping first
-        # lets us copy just the ROI instead of the whole frame.
+        # array (it never mutates one in place), so it is safe to transform
+        # this grabbed reference after releasing the lock.
+        # Rotate the full frame first, then crop — the ROI is defined in
+        # rotated-frame coordinates (exactly what the setup tool shows).
+        frame = rotate_image(frame, self.cam.rotate)
         if self.cam.roi is None:
             return frame.copy(), ts
         x, y, w, h = self.cam.roi
@@ -191,6 +207,15 @@ class CameraWorker:
                 f"frame {fw}x{fh}"
             )
         return frame[y:y + h, x:x + w].copy(), ts
+
+    def latest_raw(self):
+        """Return ``(frame_copy, timestamp)`` of the latest *uncropped,
+        unrotated* frame, or None. Used by the setup tool, which applies its
+        own trial rotation and lets you draw the ROI on the result."""
+        with self._lock:
+            if self._frame is None:
+                return None
+            return self._frame.copy(), self._frame_ts
 
     def status(self) -> dict:
         """Snapshot of this camera's state for the status/health endpoints."""
@@ -211,6 +236,8 @@ class CameraWorker:
             info["last_frame_age_s"] = round(time.time() - ts, 3)
             # frame.shape is (height, width, channels) for a color image.
             info["resolution"] = {"width": int(shape[1]), "height": int(shape[0])}
+        if self.cam.rotate:
+            info["rotate"] = self.cam.rotate
         if self.cam.roi is not None:
             x, y, w, h = self.cam.roi
             info["roi"] = {"x": x, "y": y, "width": w, "height": h}

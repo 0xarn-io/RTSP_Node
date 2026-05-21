@@ -7,7 +7,9 @@ app via FastAPI's ``lifespan`` hook.
 """
 from __future__ import annotations
 
+import html
 import io
+import json
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -16,8 +18,9 @@ from uuid import UUID
 import cv2
 import piexif
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
+from fastapi.responses import HTMLResponse
 
-from camera import CameraManager, CameraWorker
+from camera import CameraManager, CameraWorker, rotate_image
 from config import load_config
 
 logging.basicConfig(
@@ -206,6 +209,185 @@ def screenshot(
     if image_uid_hex is not None:
         headers["X-Frame-UUID"] = image_uid_hex
     return Response(content=jpeg_bytes, media_type="image/jpeg", headers=headers)
+
+
+@app.get("/cameras/{camera_id}/frame")
+def raw_frame(
+    camera: CameraWorker = Depends(get_camera),
+    rotate: float = Query(0.0, description="Rotate the full frame this many degrees (CCW) before encoding."),
+    quality: int = Query(90, ge=1, le=100, description="JPEG quality (1-100)"),
+):
+    """The full, *uncropped* frame as JPEG, optionally rotated.
+
+    Backs the setup tool: you draw the ROI on exactly the image the server
+    would crop. 404 = unknown camera, 503 = no frame yet, 500 = encode error.
+    """
+    raw = camera.latest_raw()
+    if raw is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"No frame available yet for camera '{camera.cam.id}'.",
+        )
+    frame, _ = raw
+    frame = rotate_image(frame, rotate)
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to encode frame.")
+    height, width = frame.shape[:2]
+    return Response(
+        content=buf.tobytes(),
+        media_type="image/jpeg",
+        headers={
+            "X-Frame-Width": str(width),
+            "X-Frame-Height": str(height),
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+# Self-contained setup page. It does nothing until you open it (no polling,
+# no background work) — it just fetches /frame on demand, lets you drag an
+# ROI box and pick a rotation, then prints the config lines to paste.
+_SETUP_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ROI + Rotate setup - __CAMERA_ID__</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 1rem; background:#111; color:#eee; }
+  h1 { font-size: 1.1rem; }
+  .row { margin:.5rem 0; }
+  .cols { display:flex; gap:1rem; flex-wrap:wrap; align-items:flex-start; }
+  #stage { position:relative; display:inline-block; border:1px solid #444; cursor:crosshair; touch-action:none; }
+  #frame { display:block; max-width:90vw; max-height:70vh; }
+  #box { position:absolute; border:2px solid #2ecc71; background:rgba(46,204,113,.15); pointer-events:none; display:none; }
+  button, input { font-size:1rem; padding:.25rem .5rem; }
+  input[type=number]{ width:6rem; }
+  pre { background:#000; padding:.75rem; border:1px solid #333; white-space:pre-wrap; }
+  canvas { border:1px solid #444; background:#000; max-width:45vw; }
+  .muted { color:#999; font-size:.85rem; }
+</style>
+</head>
+<body>
+<h1>ROI + Rotate setup &mdash; camera &quot;__CAMERA_ID__&quot;</h1>
+<div class="row">
+  Rotation (deg, CCW):
+  <input type="number" id="angle" step="0.5" value="__ROTATE__">
+  <button id="apply">Apply / refresh frame</button>
+  <span class="muted">Drag on the image to draw the ROI; drag again to replace it.</span>
+</div>
+<div class="cols">
+  <div>
+    <div id="stage"><img id="frame" alt="camera frame"><div id="box"></div></div>
+    <div class="row muted" id="frameinfo"></div>
+  </div>
+  <div>
+    <div class="row">Cropped preview (<span id="outsize">none</span>):</div>
+    <canvas id="preview" width="200" height="200"></canvas>
+    <div class="row">Paste into this camera's <code>config.toml</code> entry:</div>
+    <pre id="out">rotate = __ROTATE__</pre>
+  </div>
+</div>
+<script>
+const camId = __CAMERA_ID_JS__;
+const img = document.getElementById('frame');
+const stage = document.getElementById('stage');
+const box = document.getElementById('box');
+const angleEl = document.getElementById('angle');
+const out = document.getElementById('out');
+const outsize = document.getElementById('outsize');
+const frameinfo = document.getElementById('frameinfo');
+const preview = document.getElementById('preview');
+let roi = null;  // [x, y, w, h] in natural pixels
+
+function loadFrame() {
+  const a = parseFloat(angleEl.value) || 0;
+  img.onload = () => {
+    frameinfo.textContent = `frame ${img.naturalWidth}x${img.naturalHeight} (rotated ${a} deg)`;
+    if (roi) drawPreview();
+    render();
+  };
+  img.onerror = () => { frameinfo.textContent = 'no frame yet - is the camera connected?'; };
+  img.src = `/cameras/${encodeURIComponent(camId)}/frame?rotate=${a}&_=${Date.now()}`;
+}
+
+function natScale() {
+  return { x: img.naturalWidth / img.clientWidth, y: img.naturalHeight / img.clientHeight };
+}
+
+let dragging = false, sx = 0, sy = 0;
+stage.addEventListener('pointerdown', (e) => {
+  const r = img.getBoundingClientRect();
+  sx = e.clientX - r.left; sy = e.clientY - r.top;
+  dragging = true;
+  box.style.display = 'block';
+  box.style.left = sx + 'px'; box.style.top = sy + 'px';
+  box.style.width = '0px'; box.style.height = '0px';
+  stage.setPointerCapture(e.pointerId);
+});
+stage.addEventListener('pointermove', (e) => {
+  if (!dragging) return;
+  const r = img.getBoundingClientRect();
+  const cx = Math.max(0, Math.min(e.clientX - r.left, img.clientWidth));
+  const cy = Math.max(0, Math.min(e.clientY - r.top, img.clientHeight));
+  box.style.left = Math.min(sx, cx) + 'px';
+  box.style.top = Math.min(sy, cy) + 'px';
+  box.style.width = Math.abs(cx - sx) + 'px';
+  box.style.height = Math.abs(cy - sy) + 'px';
+});
+stage.addEventListener('pointerup', () => {
+  if (!dragging) return;
+  dragging = false;
+  const s = natScale();
+  let x = Math.round(parseFloat(box.style.left) * s.x);
+  let y = Math.round(parseFloat(box.style.top) * s.y);
+  let w = Math.round(parseFloat(box.style.width) * s.x);
+  let h = Math.round(parseFloat(box.style.height) * s.y);
+  x = Math.max(0, Math.min(x, img.naturalWidth));
+  y = Math.max(0, Math.min(y, img.naturalHeight));
+  w = Math.max(1, Math.min(w, img.naturalWidth - x));
+  h = Math.max(1, Math.min(h, img.naturalHeight - y));
+  roi = [x, y, w, h];
+  drawPreview();
+  render();
+});
+
+function drawPreview() {
+  const [x, y, w, h] = roi;
+  preview.width = w; preview.height = h;
+  preview.getContext('2d').drawImage(img, x, y, w, h, 0, 0, w, h);
+}
+
+function render() {
+  const a = parseFloat(angleEl.value) || 0;
+  let text = `rotate = ${a}`;
+  if (roi) {
+    text += `\\nroi = [${roi[0]}, ${roi[1]}, ${roi[2]}, ${roi[3]}]`;
+    outsize.textContent = `${roi[2]}x${roi[3]}`;
+  } else {
+    outsize.textContent = 'none';
+  }
+  out.textContent = text;
+}
+
+document.getElementById('apply').addEventListener('click', loadFrame);
+loadFrame();
+</script>
+</body>
+</html>"""
+
+
+@app.get("/cameras/{camera_id}/setup", response_class=HTMLResponse)
+def setup_tool(camera: CameraWorker = Depends(get_camera)):
+    """Serve the on-demand ROI + rotate setup page for one camera."""
+    page = (
+        _SETUP_PAGE
+        .replace("__CAMERA_ID_JS__", json.dumps(camera.cam.id))
+        .replace("__CAMERA_ID__", html.escape(camera.cam.id))
+        .replace("__ROTATE__", str(camera.cam.rotate))
+    )
+    return HTMLResponse(content=page)
 
 
 # Allows `python main.py` to run the server using the [server] section of
