@@ -17,6 +17,7 @@ import logging
 import os
 import threading
 import time
+from dataclasses import replace
 from typing import Optional
 
 import cv2
@@ -216,6 +217,19 @@ class CameraWorker:
             if self._frame is None:
                 return None
             return self._frame.copy(), self._frame_ts
+
+    def update_config(self, *, rotate: float | None = None,
+                      roi: tuple[int, int, int, int] | None = None) -> None:
+        """Live-swap this worker's rotation/ROI by replacing the frozen
+        CameraConfig. snapshot() picks it up on its next call, since the
+        whole self.cam object is reassigned in one atomic step."""
+        changes = {}
+        if rotate is not None:
+            changes["rotate"] = rotate
+        if roi is not None:
+            changes["roi"] = roi
+        if changes:
+            self.cam = replace(self.cam, **changes)
 
     def status(self) -> dict:
         """Snapshot of this camera's state for the status/health endpoints."""
